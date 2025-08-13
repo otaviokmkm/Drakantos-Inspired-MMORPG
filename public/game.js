@@ -363,6 +363,8 @@
     for (const pid in projectiles) {
       const pr = projectiles[pid];
       if (!pr) continue;
+      // Cull offscreen
+      if (pr.x < -20 || pr.y < -20 || pr.x > canvas.width + 20 || pr.y > canvas.height + 20) continue;
       ctx.beginPath();
       ctx.fillStyle = pr.kind === 'fireball' ? '#ff7a3c' : '#fff';
       ctx.arc(pr.x, pr.y, pr.radius || 4, 0, Math.PI*2);
@@ -376,6 +378,8 @@
     for (const eid in enemies) {
       const en = enemies[eid];
       if (!en) continue;
+      // Cull offscreen
+      if (en.x < -40 || en.y < -40 || en.x > canvas.width + 40 || en.y > canvas.height + 40) continue;
       ctx.beginPath();
       ctx.fillStyle = en.kind === 'slime' ? '#6bd36b' : '#bbb';
       ctx.arc(en.x, en.y, en.radius || 12, 0, Math.PI*2);
@@ -459,29 +463,18 @@
 
   function reconcileToServer(serverMe, lastSeq) {
     const me = players[playerId]; if (!me) return;
-    const dxPos = me.x - serverMe.x;
-    const dyPos = me.y - serverMe.y;
+    // discard confirmed inputs to prevent growth
+    let i = 0; while (i < pendingInputs.length && pendingInputs[i].seq <= lastSeq) i++;
+    if (i > 0) pendingInputs.splice(0, i);
+    // blend towards server to hide snaps
+    const dxPos = serverMe.x - me.x;
+    const dyPos = serverMe.y - me.y;
     const err = Math.hypot(dxPos, dyPos);
-    const THRESH = 4; // pixels tolerance
+    const THRESH = 3; // pixels tolerance
     if (err > THRESH) {
-      // Snap to server position, then reapply pending inputs after lastSeq
-      me.x = serverMe.x; me.y = serverMe.y;
-      // drop all inputs up to and including lastSeq
-      let i = 0;
-      while (i < pendingInputs.length && pendingInputs[i].seq <= lastSeq) i++;
-      const remaining = pendingInputs.slice(i);
-      // rebuild from server-auth position
-      for (const inp of remaining) {
-        me.x += inp.dx * inp.dt;
-        me.y += inp.dy * inp.dt;
-      }
-      // keep only remaining for future reconciliation
-      pendingInputs.length = 0;
-      Array.prototype.push.apply(pendingInputs, remaining);
-    } else {
-      // discard confirmed inputs to prevent growth
-      let i = 0; while (i < pendingInputs.length && pendingInputs[i].seq <= lastSeq) i++;
-      if (i > 0) pendingInputs.splice(0, i);
+      const BLEND = 0.25; // correct 25% per update
+      me.x += dxPos * BLEND;
+      me.y += dyPos * BLEND;
     }
   }
 

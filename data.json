@@ -21,19 +21,19 @@
         },
         "firemage": {
           "level": 4,
-          "xp": 200,
+          "xp": 180,
           "hpMax": 115,
           "hp": 16
         }
       },
-      "gold": 55
+      "gold": 61
     },
     "admin1": {
       "selectedClass": "firemage",
       "classes": {
         "firemage": {
           "level": 3,
-          "xp": 141,
+          "xp": 127,
           "hpMax": 110,
           "hp": 110
         }

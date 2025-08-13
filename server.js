@@ -75,7 +75,13 @@ app.get('/api/me', authMiddleware, (req, res) => {
 });
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, {
+  cors: { origin: '*' },
+  perMessageDeflate: {
+    threshold: 1024,
+    zlibDeflateOptions: { level: 6 }
+  }
+});
 const TICK_MS = 33; // ~30 Hz
 const SPEED = 200; // px/s
 const WORLD = { w: 800, h: 600 };
@@ -575,6 +581,13 @@ setInterval(() => {
   for (const [uid, s] of sockets) {
     const p = players.get(uid);
     if (!p) continue;
+    // adaptive emit rate: slower when idle
+    const inp = inputs.get(uid);
+    const idle = !inp || (now - (inp.at || 0) > 200) || ((inp.dx || 0) === 0 && (inp.dy || 0) === 0);
+    const minInterval = idle ? 100 : 50; // 10-20 Hz
+    const last = s._lastEmitAt || 0;
+    if (now - last < minInterval) continue;
+    s._lastEmitAt = now;
     const snap = buildSnapshotForMap(p.map || 'grass', uid);
     snap.serverTime = now;
     s.volatile.emit('state', snap);
@@ -651,11 +664,30 @@ function handlePlayerDeath(p, now = Date.now(), killerId = null, isPvp = false) 
 
 function buildSnapshotForMap(mapId = 'grass', selfId = null) {
   const pl = {};
-  for (const [id, p] of players) if ((p.map || 'grass') === mapId) pl[id] = p;
+  for (const [id, p] of players) {
+    if ((p.map || 'grass') !== mapId) continue;
+    if (selfId && id === selfId) {
+      // send richer data for self (used by reconciliation/UI)
+      pl[id] = {
+        id: p.id, name: p.name, x: p.x, y: p.y, class: p.class, level: p.level,
+        hp: p.hp, hpMax: p.hpMax, xpByClass: p.xpByClass, gold: p.gold,
+        slowUntil: p.slowUntil, slowFactor: p.slowFactor, lastProcessedSeq: p.lastProcessedSeq || 0
+      };
+    } else {
+      // trimmed for others
+      pl[id] = { name: p.name, x: p.x, y: p.y, class: p.class, hp: p.hp, hpMax: p.hpMax };
+    }
+  }
   const pr = {};
-  for (const [id, prj] of projectiles) if ((prj.map || 'grass') === mapId) pr[id] = prj;
+  for (const [id, prj] of projectiles) {
+    if ((prj.map || 'grass') !== mapId) continue;
+    pr[id] = { x: prj.x, y: prj.y, radius: prj.radius, kind: prj.kind };
+  }
   const en = {};
-  for (const [id, e] of enemies) if ((e.map || 'grass') === mapId) en[id] = e;
+  for (const [id, e] of enemies) {
+    if ((e.map || 'grass') !== mapId) continue;
+    en[id] = { x: e.x, y: e.y, radius: e.radius, hp: e.hp, hpMax: e.hpMax, kind: e.kind || 'slime' };
+  }
   // augment self with totalLevel and rewardMult
   if (selfId && pl[selfId]) {
     const pdata = storage.getPlayerData(selfId) || { classes: {} };
