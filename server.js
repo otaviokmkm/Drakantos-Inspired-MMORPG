@@ -5,6 +5,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
+const compression = require('compression');
 const storage = require('./storage');
 
 const PORT = process.env.PORT || 3000;
@@ -13,6 +14,8 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const app = express();
 app.use(cors());
 app.use(express.json());
+// Enable HTTP compression for REST and static assets
+app.use(compression({ threshold: 1024 }));
 app.use(express.static('public'));
 
 // In-memory stores
@@ -75,17 +78,12 @@ app.get('/api/me', authMiddleware, (req, res) => {
 });
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' },
-  perMessageDeflate: {
-    threshold: 1024,
-    zlibDeflateOptions: { level: 6 }
-  }
-});
+// Enable per-message deflate for socket frames to reduce bandwidth
+const io = new Server(server, { cors: { origin: '*' }, perMessageDeflate: { threshold: 1024 } });
 const TICK_MS = 33; // ~30 Hz
 const SPEED = 200; // px/s
 const WORLD = { w: 800, h: 600 };
-const inputs = new Map(); // username -> { dx, dy, at, seq }
+const inputs = new Map(); // username -> { dx, dy, at }
 const respawnQueue = []; // [{ at, count }]
 // Anti-cheat notes:
 // - Server-authoritative movement and combat
@@ -161,7 +159,7 @@ io.on('connection', (socket) => {
   pSelf.map = pSelf.map || 'grass';
 
   // Send initial state
-  socket.emit('initState', buildSnapshotForMap(pSelf.map, username));
+  socket.emit('initState', buildSnapshotForPlayer(username));
   // notify others in same map
   for (const [u, s] of sockets) {
     if (u === username) continue;
@@ -170,7 +168,7 @@ io.on('connection', (socket) => {
   }
 
   // Authoritative input: client only sends direction intent
-  socket.on('input', ({ dx, dy, seq }) => {
+  socket.on('input', ({ dx, dy }) => {
   // simple anti-cheat rate limit: max 50 inputs/second
   const now = Date.now();
   socket._rateIn = socket._rateIn || { c: 0, t: now };
@@ -181,7 +179,7 @@ io.on('connection', (socket) => {
     const ndx = Number(dx) || 0;
     const ndy = Number(dy) || 0;
     // clamp to [-1,1]
-    inputs.set(username, { dx: Math.max(-1, Math.min(1, ndx)), dy: Math.max(-1, Math.min(1, ndy)), at: Date.now(), seq: Number(seq) || 0 });
+    inputs.set(username, { dx: Math.max(-1, Math.min(1, ndx)), dy: Math.max(-1, Math.min(1, ndy)), at: Date.now() });
   });
 
   // Class selection (only 'firemage' for now)
@@ -320,7 +318,7 @@ setInterval(() => {
 
   // Apply inputs to move players
   for (const [id, p] of players) {
-    const inp = inputs.get(id) || { dx: 0, dy: 0, at: 0, seq: p.lastProcessedSeq || 0 };
+    const inp = inputs.get(id) || { dx: 0, dy: 0, at: 0 };
     let { dx, dy, at } = inp;
     if (!at || (now - at) > 200) { dx = 0; dy = 0; }
     const len = Math.hypot(dx, dy) || 0;
@@ -330,8 +328,6 @@ setInterval(() => {
   const speedFactor = slowActive ? (p.slowFactor || 0.6) : 1;
     p.x += dx * SPEED * speedFactor * dt;
     p.y += dy * SPEED * speedFactor * dt;
-    // mark last processed input sequence number for reconciliation
-    p.lastProcessedSeq = inp.seq || p.lastProcessedSeq || 0;
     // map transitions at edges
     p.map = p.map || 'grass';
     if (p.map === 'grass' && p.x >= WORLD.w - 5) {
@@ -577,20 +573,17 @@ setInterval(() => {
   spawnSlimes(job.map || 'grass', count);
   }
 
-  // Per-player, per-map snapshots
+  // Per-player, AOI-culled, throttled snapshots
   for (const [uid, s] of sockets) {
     const p = players.get(uid);
     if (!p) continue;
-    // adaptive emit rate: slower when idle
-    const inp = inputs.get(uid);
-    const idle = !inp || (now - (inp.at || 0) > 200) || ((inp.dx || 0) === 0 && (inp.dy || 0) === 0);
-    const minInterval = idle ? 100 : 50; // 10-20 Hz
-    const last = s._lastEmitAt || 0;
-    if (now - last < minInterval) continue;
-    s._lastEmitAt = now;
-    const snap = buildSnapshotForMap(p.map || 'grass', uid);
-    snap.serverTime = now;
-    s.volatile.emit('state', snap);
+    const nowTs = Date.now();
+    // Throttle snapshot emits to ~15Hz per client
+    if (!s._lastSnapAt || (nowTs - s._lastSnapAt) >= 66) {
+      const snap = buildSnapshotForPlayer(uid);
+      s.volatile.emit('state', snap);
+      s._lastSnapAt = nowTs;
+    }
   }
 }, TICK_MS);
 
@@ -664,30 +657,11 @@ function handlePlayerDeath(p, now = Date.now(), killerId = null, isPvp = false) 
 
 function buildSnapshotForMap(mapId = 'grass', selfId = null) {
   const pl = {};
-  for (const [id, p] of players) {
-    if ((p.map || 'grass') !== mapId) continue;
-    if (selfId && id === selfId) {
-      // send richer data for self (used by reconciliation/UI)
-      pl[id] = {
-        id: p.id, name: p.name, x: p.x, y: p.y, class: p.class, level: p.level,
-        hp: p.hp, hpMax: p.hpMax, xpByClass: p.xpByClass, gold: p.gold,
-        slowUntil: p.slowUntil, slowFactor: p.slowFactor, lastProcessedSeq: p.lastProcessedSeq || 0
-      };
-    } else {
-      // trimmed for others
-      pl[id] = { name: p.name, x: p.x, y: p.y, class: p.class, hp: p.hp, hpMax: p.hpMax };
-    }
-  }
+  for (const [id, p] of players) if ((p.map || 'grass') === mapId) pl[id] = p;
   const pr = {};
-  for (const [id, prj] of projectiles) {
-    if ((prj.map || 'grass') !== mapId) continue;
-    pr[id] = { x: prj.x, y: prj.y, radius: prj.radius, kind: prj.kind };
-  }
+  for (const [id, prj] of projectiles) if ((prj.map || 'grass') === mapId) pr[id] = prj;
   const en = {};
-  for (const [id, e] of enemies) {
-    if ((e.map || 'grass') !== mapId) continue;
-    en[id] = { x: e.x, y: e.y, radius: e.radius, hp: e.hp, hpMax: e.hpMax, kind: e.kind || 'slime' };
-  }
+  for (const [id, e] of enemies) if ((e.map || 'grass') === mapId) en[id] = e;
   // augment self with totalLevel and rewardMult
   if (selfId && pl[selfId]) {
     const pdata = storage.getPlayerData(selfId) || { classes: {} };
@@ -700,6 +674,68 @@ function buildSnapshotForMap(mapId = 'grass', selfId = null) {
     pl[selfId] = { ...pl[selfId], totalLevel: total, rewardMult };
   }
   return { selfId: selfId || null, map: mapId, players: pl, projectiles: pr, enemies: en };
+}
+
+// Build a lean snapshot for a specific player, with Area-Of-Interest culling
+function buildSnapshotForPlayer(selfId) {
+  const self = players.get(selfId);
+  const mapId = (self?.map) || 'grass';
+  const cx = Math.max(0, Math.min(WORLD.w, self?.x ?? WORLD.w / 2));
+  const cy = Math.max(0, Math.min(WORLD.h, self?.y ?? WORLD.h / 2));
+  const AOI_R = 480; // px radius around the player
+  const AOI_R2 = AOI_R * AOI_R;
+
+  // Helpers to reduce payload size
+  const r2 = (x, y) => ((x - cx) * (x - cx) + (y - cy) * (y - cy));
+  const q2 = (v) => Math.round(v * 100) / 100; // 2 decimal quantize
+  const leanPlayer = (p, isSelf) => {
+    const base = {
+      id: p.id,
+      name: p.name,
+      x: q2(p.x),
+      y: q2(p.y),
+      hp: p.hp,
+      hpMax: p.hpMax,
+      class: p.class,
+      level: p.level,
+    };
+    if (isSelf) {
+      // Include only what client HUD needs
+      base.gold = p.gold || 0;
+      base.xpByClass = p.xpByClass || {};
+      // Augment with totalLevel and rewardMult
+      const pdata = storage.getPlayerData(p.id) || { classes: {} };
+      let total = 0;
+      for (const cls of Object.values(pdata.classes || {})) {
+        const lvl = typeof cls.level === 'number' ? cls.level : 1;
+        total += Math.max(1, lvl);
+      }
+      base.totalLevel = total;
+      base.rewardMult = Math.min(1 + (total - 1) * 0.05, 3);
+    }
+    return base;
+  };
+  const leanProj = (pr) => ({ id: pr.id, kind: pr.kind, x: q2(pr.x), y: q2(pr.y), radius: pr.radius || 4 });
+  const leanEnemy = (e) => ({ id: e.id, kind: e.kind, x: q2(e.x), y: q2(e.y), radius: e.radius || 12, hp: e.hp, hpMax: e.hpMax });
+
+  const pl = {};
+  for (const [id, p] of players) {
+    if ((p.map || 'grass') !== mapId) continue;
+    if (id === selfId) { pl[id] = leanPlayer(p, true); continue; }
+    if (r2(p.x, p.y) <= AOI_R2) pl[id] = leanPlayer(p, false);
+  }
+  const pr = {};
+  for (const [id, prj] of projectiles) {
+    if ((prj.map || 'grass') !== mapId) continue;
+    if (r2(prj.x, prj.y) <= AOI_R2) pr[id] = leanProj(prj);
+  }
+  const en = {};
+  for (const [id, e] of enemies) {
+    if ((e.map || 'grass') !== mapId) continue;
+    if (r2(e.x, e.y) <= AOI_R2) en[id] = leanEnemy(e);
+  }
+
+  return { selfId, map: mapId, players: pl, projectiles: pr, enemies: en };
 }
 
 function getRewardMultiplier(userId) {
