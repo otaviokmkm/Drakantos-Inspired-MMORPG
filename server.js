@@ -79,7 +79,7 @@ const io = new Server(server, { cors: { origin: '*' } });
 const TICK_MS = 33; // ~30 Hz
 const SPEED = 200; // px/s
 const WORLD = { w: 800, h: 600 };
-const inputs = new Map(); // username -> { dx, dy, at }
+const inputs = new Map(); // username -> { dx, dy, at, seq }
 const respawnQueue = []; // [{ at, count }]
 // Anti-cheat notes:
 // - Server-authoritative movement and combat
@@ -164,7 +164,7 @@ io.on('connection', (socket) => {
   }
 
   // Authoritative input: client only sends direction intent
-  socket.on('input', ({ dx, dy }) => {
+  socket.on('input', ({ dx, dy, seq }) => {
   // simple anti-cheat rate limit: max 50 inputs/second
   const now = Date.now();
   socket._rateIn = socket._rateIn || { c: 0, t: now };
@@ -175,7 +175,7 @@ io.on('connection', (socket) => {
     const ndx = Number(dx) || 0;
     const ndy = Number(dy) || 0;
     // clamp to [-1,1]
-    inputs.set(username, { dx: Math.max(-1, Math.min(1, ndx)), dy: Math.max(-1, Math.min(1, ndy)), at: Date.now() });
+    inputs.set(username, { dx: Math.max(-1, Math.min(1, ndx)), dy: Math.max(-1, Math.min(1, ndy)), at: Date.now(), seq: Number(seq) || 0 });
   });
 
   // Class selection (only 'firemage' for now)
@@ -314,7 +314,7 @@ setInterval(() => {
 
   // Apply inputs to move players
   for (const [id, p] of players) {
-    const inp = inputs.get(id) || { dx: 0, dy: 0, at: 0 };
+    const inp = inputs.get(id) || { dx: 0, dy: 0, at: 0, seq: p.lastProcessedSeq || 0 };
     let { dx, dy, at } = inp;
     if (!at || (now - at) > 200) { dx = 0; dy = 0; }
     const len = Math.hypot(dx, dy) || 0;
@@ -324,6 +324,8 @@ setInterval(() => {
   const speedFactor = slowActive ? (p.slowFactor || 0.6) : 1;
     p.x += dx * SPEED * speedFactor * dt;
     p.y += dy * SPEED * speedFactor * dt;
+    // mark last processed input sequence number for reconciliation
+    p.lastProcessedSeq = inp.seq || p.lastProcessedSeq || 0;
     // map transitions at edges
     p.map = p.map || 'grass';
     if (p.map === 'grass' && p.x >= WORLD.w - 5) {
@@ -574,6 +576,7 @@ setInterval(() => {
     const p = players.get(uid);
     if (!p) continue;
     const snap = buildSnapshotForMap(p.map || 'grass', uid);
+    snap.serverTime = now;
     s.volatile.emit('state', snap);
   }
 }, TICK_MS);

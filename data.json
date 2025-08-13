@@ -21,7 +21,7 @@
         },
         "firemage": {
           "level": 4,
-          "xp": 0,
+          "xp": 200,
           "hpMax": 115,
           "hp": 16
         }

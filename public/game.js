@@ -19,7 +19,7 @@
   let socket = null;
   let playerId = null;
   let players = {}; // id -> { x, y, name, class }
-  const snapshotBuffer = []; // [{ time, players }]
+  const snapshotBuffer = []; // [{ time, players, lastProcessedSeqById }]
   const INTERP_DELAY = 120; // ms
   let lastServerSelf = null;
   let isClassOpen = false;
@@ -30,9 +30,12 @@
   let showInventory = false;
   const slotCooldowns = new Map(); // slot -> msRemaining (client view)
   const unlockLevels = [1,3,6,10,18];
-  // Input send tracking (server-authoritative movement)
+  // Input send tracking + client-side prediction history
   let lastSentInput = { dx: 0, dy: 0 };
   let lastInputSendAt = 0;
+  let inputSeq = 0; // monotonically increasing sequence number
+  const pendingInputs = []; // [{seq, dx, dy, dt}]
+  let serverLastProcessedSeq = 0; // from server snapshots (self)
 
   function showGame() {
     authContainer.style.display = 'none';
@@ -110,7 +113,10 @@
       projectiles = state.projectiles || {};
       enemies = state.enemies || {};
       snapshotBuffer.length = 0;
-      snapshotBuffer.push({ time: performance.now(), players: deepClone(state.players || {}) });
+      snapshotBuffer.push({ time: performance.now(), players: deepClone(state.players || {}), lastProcessedSeqById: collectSeqs(state.players || {}) });
+      // initialize reconciliation pointer for self
+      const me = players[playerId];
+      if (me && typeof me.lastProcessedSeq === 'number') serverLastProcessedSeq = me.lastProcessedSeq;
     });
 
     socket.on('playerJoined', (p) => {
@@ -124,21 +130,31 @@
     socket.on('state', (serverState) => {
       const serverPlayers = serverState.players || serverState; // backward compat
       const now = performance.now();
-      snapshotBuffer.push({ time: now, players: deepClone(serverPlayers) });
+      snapshotBuffer.push({ time: now, players: deepClone(serverPlayers), lastProcessedSeqById: collectSeqs(serverPlayers) });
       while (snapshotBuffer.length > 0 && (now - snapshotBuffer[0].time) > 2000) {
         snapshotBuffer.shift();
       }
-    // Replace snapshot of players entirely; render uses snapshots anyway
+      // Replace snapshot of players entirely; render uses snapshots anyway
       currentMap = serverState.map || currentMap;
       players = serverPlayers;
       projectiles = serverState.projectiles || {};
       enemies = serverState.enemies || {};
+
+      // Reconciliation: if we have server's auth state for self with lastProcessedSeq
+      const meServer = players[playerId];
+      if (meServer && typeof meServer.lastProcessedSeq === 'number') {
+        const lastSeq = meServer.lastProcessedSeq;
+        serverLastProcessedSeq = lastSeq;
+        reconcileToServer(meServer, lastSeq);
+      }
     });
 
     socket.on('teleport', ({ x, y }) => {
       const me = players[playerId];
       if (me) { me.x = x; me.y = y; }
-      snapshotBuffer.length = 0; // snap to server
+  snapshotBuffer.length = 0; // snap to server
+  pendingInputs.length = 0; // drop unconfirmed inputs
+  serverLastProcessedSeq = 0;
     });
 
     socket.on('floatText', (msg) => {
@@ -248,7 +264,29 @@
     const dt = (ts - last) / 1000; last = ts;
 
     // Send inputs to server
-    sendInputIfNeeded();
+    sendInputIfNeeded(dt);
+
+    // Client-side prediction: apply own input immediately to local player
+    const me = players[playerId];
+    if (me) {
+      const v = currentInputVector();
+      let dx = v.dx, dy = v.dy;
+      const len = Math.hypot(dx, dy) || 0;
+      if (len > 0) { dx /= len; dy /= len; }
+      const slowActive = (me.slowUntil || 0) > performance.now();
+      const speedFactor = slowActive ? (me.slowFactor || 0.6) : 1;
+      if (dx !== 0 || dy !== 0) {
+        me.x += dx * speed * speedFactor * dt;
+        me.y += dy * speed * speedFactor * dt;
+      }
+      // enqueue predicted input for reconciliation
+      if (dx !== 0 || dy !== 0) {
+        pendingInputs.push({ seq: inputSeq, dx, dy, dt: dt * speed * speedFactor });
+      } else if (pendingInputs.length && pendingInputs[pendingInputs.length-1]?.seq !== inputSeq) {
+        // still advance seq even if idle to keep ordering consistent
+        pendingInputs.push({ seq: inputSeq, dx: 0, dy: 0, dt: 0 });
+      }
+    }
 
   // render
     ctx.clearRect(0,0,canvas.width,canvas.height);
@@ -272,18 +310,23 @@
   for (const id in base) {
       let x, y, name;
       name = (players[id]?.name) || (base[id]?.name) || 'player';
-        const pa = a?.players[id];
-        const pb = b?.players[id];
-        if (pa && pb && b.time !== a.time) {
-          const t = (renderTime - a.time) / (b.time - a.time);
-          x = smoothstepLerp(pa.x, pb.x, t);
-          y = smoothstepLerp(pa.y, pb.y, t);
-        } else if (pa) {
-          x = pa.x; y = pa.y;
-        } else if (pb) {
-          x = pb.x; y = pb.y;
+        if (id === playerId && players[id]) {
+          // use predicted local position
+          x = players[id].x; y = players[id].y;
         } else {
-          continue;
+          const pa = a?.players[id];
+          const pb = b?.players[id];
+          if (pa && pb && b.time !== a.time) {
+            const t = (renderTime - a.time) / (b.time - a.time);
+            x = smoothstepLerp(pa.x, pb.x, t);
+            y = smoothstepLerp(pa.y, pb.y, t);
+          } else if (pa) {
+            x = pa.x; y = pa.y;
+          } else if (pb) {
+            x = pb.x; y = pb.y;
+          } else {
+            continue;
+          }
         }
       ctx.beginPath();
       // slow effect visual for self
@@ -391,22 +434,59 @@
   function smoothstep(t){ t = Math.max(0, Math.min(1, t)); return t*t*(3-2*t);} 
   function smoothstepLerp(a,b,t){ return lerp(a,b,smoothstep(t)); }
 
-  function sendInputIfNeeded() {
+  function sendInputIfNeeded(dt) {
     if (!socket || !playerId) return;
+    const { dx, dy } = currentInputVector();
+    const len = Math.hypot(dx, dy) || 0;
+    const now = performance.now();
+    const changed = dx !== lastSentInput.dx || dy !== lastSentInput.dy;
+    if (changed || (now - lastInputSendAt) > 100) {
+      inputSeq = (inputSeq + 1) >>> 0; // wrap-safe 32-bit
+      socket.emit('input', { dx, dy, seq: inputSeq });
+      lastSentInput = { dx, dy };
+      lastInputSendAt = now;
+    }
+  }
+
+  function currentInputVector() {
     let dx = 0, dy = 0;
     if (keys.has('w') || keys.has('arrowup')) dy -= 1;
     if (keys.has('s') || keys.has('arrowdown')) dy += 1;
     if (keys.has('a') || keys.has('arrowleft')) dx -= 1;
     if (keys.has('d') || keys.has('arrowright')) dx += 1;
-    const len = Math.hypot(dx, dy) || 0;
-    if (len > 0) { dx /= len; dy /= len; }
-    const now = performance.now();
-    const changed = dx !== lastSentInput.dx || dy !== lastSentInput.dy;
-    if (changed || (now - lastInputSendAt) > 100) {
-      socket.emit('input', { dx, dy });
-      lastSentInput = { dx, dy };
-      lastInputSendAt = now;
+    return { dx, dy };
+  }
+
+  function reconcileToServer(serverMe, lastSeq) {
+    const me = players[playerId]; if (!me) return;
+    const dxPos = me.x - serverMe.x;
+    const dyPos = me.y - serverMe.y;
+    const err = Math.hypot(dxPos, dyPos);
+    const THRESH = 4; // pixels tolerance
+    if (err > THRESH) {
+      // Snap to server position, then reapply pending inputs after lastSeq
+      me.x = serverMe.x; me.y = serverMe.y;
+      // drop all inputs up to and including lastSeq
+      let i = 0;
+      while (i < pendingInputs.length && pendingInputs[i].seq <= lastSeq) i++;
+      const remaining = pendingInputs.slice(i);
+      // rebuild from server-auth position
+      for (const inp of remaining) {
+        me.x += inp.dx * inp.dt;
+        me.y += inp.dy * inp.dt;
+      }
+      // keep only remaining for future reconciliation
+      pendingInputs.length = 0;
+      Array.prototype.push.apply(pendingInputs, remaining);
+    } else {
+      // discard confirmed inputs to prevent growth
+      let i = 0; while (i < pendingInputs.length && pendingInputs[i].seq <= lastSeq) i++;
+      if (i > 0) pendingInputs.splice(0, i);
     }
+  }
+
+  function collectSeqs(pl) {
+    const map = {}; for (const id in pl) map[id] = pl[id]?.lastProcessedSeq || 0; return map;
   }
 
   // Health bar drawing helper
