@@ -1,0 +1,44 @@
+{
+  "users": {
+    "123": {
+      "username": "123",
+      "passHash": "$2b$10$nkch3CAvt1ml3K.g7x.r0ex3voUl.ZaJTQ/I3Gdm9nZ6sTEvzLfXi"
+    },
+    "admin1": {
+      "username": "admin1",
+      "passHash": "$2b$10$ETW/YXb4OXJ6B1Yy4Rs/ReoNYQPqGukGRQP6UNtnV00QrXFu5KpSK"
+    }
+  },
+  "playerData": {
+    "123": {
+      "selectedClass": "firemage",
+      "classes": {
+        "none": {
+          "level": 1,
+          "xp": 0,
+          "hpMax": 100,
+          "hp": 100
+        },
+        "firemage": {
+          "level": 4,
+          "xp": 0,
+          "hpMax": 115,
+          "hp": 16
+        }
+      },
+      "gold": 55
+    },
+    "admin1": {
+      "selectedClass": "firemage",
+      "classes": {
+        "firemage": {
+          "level": 3,
+          "xp": 141,
+          "hpMax": 110,
+          "hp": 110
+        }
+      },
+      "gold": 15
+    }
+  }
+}
